@@ -9,5 +9,9 @@ bot.log
 bot.log.old
 bot.err.log
 bot.err.log.old
+capture.log
+*.log
 close-markers/
 outbox/
+.claude/
+.DS_Store

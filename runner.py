@@ -1,3 +1,4 @@
+import os
 from typing import AsyncIterator, Awaitable, Callable, Optional, Tuple
 
 from claude_agent_sdk import (
@@ -13,6 +14,11 @@ from claude_agent_sdk import (
 
 # Read-only tools are pre-approved with no Discord round-trip.
 READ_ONLY_TOOLS = {"Read", "Grep", "Glob", "LS"}
+
+# Auto / bypass-permissions mode (default on; CC_SKIP_PERMISSIONS=0 to require approval).
+# When on, SDK-mode turns run every tool without a Discord approval round-trip — matching
+# the terminal sessions launched with --dangerously-skip-permissions.
+SKIP_PERMISSIONS = os.environ.get("CC_SKIP_PERMISSIONS", "1") != "0"
 
 # Async approver: given (tool_name, tool_input), returns True iff the user approved.
 Approver = Callable[[str, dict], Awaitable[bool]]
@@ -54,11 +60,26 @@ async def run_turn(
         ("tool", str, dict)            — tool was attempted (allow/deny is handled in callback)
         ("done", session_id, cost_usd)
     """
-    options = ClaudeAgentOptions(
-        cwd=cwd,
-        resume=resume_id,
-        can_use_tool=_make_can_use_tool(on_approval),
-    )
+    # Load the user's CLI settings so SDK turns inherit the claude.ai MCP connectors
+    # (Gmail, Google Calendar, etc.). Without this, SDK 0.2.x starts with NO settings and
+    # those tools are invisible — even though `claude mcp list` shows them connected.
+    setting_sources = ["user", "project", "local"]
+
+    if SKIP_PERMISSIONS:
+        # Bypass mode: no can_use_tool callback, so tools run with no Discord approval.
+        options = ClaudeAgentOptions(
+            cwd=cwd,
+            resume=resume_id,
+            permission_mode="bypassPermissions",
+            setting_sources=setting_sources,
+        )
+    else:
+        options = ClaudeAgentOptions(
+            cwd=cwd,
+            resume=resume_id,
+            can_use_tool=_make_can_use_tool(on_approval),
+            setting_sources=setting_sources,
+        )
 
     session_id: Optional[str] = None
     cost: Optional[float] = None

@@ -1,143 +1,95 @@
-# cc-discord-remote
+# claude-code-discord-bot
 
 ![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)
+![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Windows-lightgrey.svg)
 ![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)
-[![Build](https://github.com/reubenlavin08/cc-discord-remote/actions/workflows/ci.yml/badge.svg)](https://github.com/reubenlavin08/cc-discord-remote/actions/workflows/ci.yml)
 
-Drive [Claude Code](https://claude.com/claude-code) running in a terminal on your laptop from a Discord channel on your phone. Real live-attach to an already-running terminal session — every keystroke goes into the *actual* Claude process, every response streams back. Headless fallback via the Agent SDK when no terminal exists.
+Drive [Claude Code](https://claude.com/claude-code) running on your laptop from a Discord channel on your phone. Type a task in Discord → it runs on your machine → the response streams back. Tool actions (Edit / Write / Bash) surface as tappable **Approve / Deny** buttons. Cross-platform: a **macOS** implementation (pseudo-terminal + screen emulation) and the original **Windows** implementation (Win32 console APIs).
 
 ```
-┌─────────┐   Discord    ┌──────────┐    Windows Console API   ┌──────────────┐
-│ phone   │ ────────────►│ bot      │ ───── WriteConsoleInput ►│ claude.exe   │
-│ (you)   │ ◄────────────│ (Python) │ ◄──── JSONL tail ────────│ (in terminal)│
+┌─────────┐   Discord    ┌──────────┐   pty / Win32 console    ┌──────────────┐
+│ phone   │ ───────────► │   bot    │ ───── inject keys ─────► │ Claude Code  │
+│ (you)   │ ◄─────────── │ (Python) │ ◄──── read output ────── │ on laptop    │
 └─────────┘              └──────────┘                          └──────────────┘
 ```
 
-## Highlights
-
-- **True live-attach**, not screen-scraping — `AttachConsole` + `WriteConsoleInput` against any running `claude.exe`
-- **Bidirectional mirror** — terminal activity streams to Discord, Discord messages stream to the terminal
-- **TUI menus → Discord components** — slash commands (`/powerup`, `/model`, `/agents`, `/resume`) auto-snapshot the screen with a clickable keypad attached. Tap a button → key fires into the terminal → same Discord message edits in place with the new screen
-- **AskUserQuestion → tappable buttons** — when Claude asks a multiple-choice question, the bot eagerly posts it to Discord with one button per option and an @mention. Tap an option → the bot navigates the TUI picker and confirms. No typing required
-- **Per-tool Discord button approvals** — both in SDK mode (`can_use_tool`) and in attached-terminal mode (screen-detected popup → Allow / Deny / Deny + tell Claude buttons, with a Modal for free-text reasoning)
-- **One Discord channel per terminal** — `!cc spawn <name>` auto-creates `#<name>`, attached and mirroring; `!cc close` kills the PowerShell window too, not just the channel
-- **Survives reboots** — channels are bound to the durable `session_id`, not the ephemeral PID. On a machine restart the bot resumes every tracked terminal (`claude --resume`) and re-attaches its Discord channel. Channels it didn't create (e.g. notifications) are never deleted
-- **Offline message replay** — messages sent while the laptop was off are queued in Discord and processed in order when the bot comes back online
-- **Honest fallback** — when no live terminal exists for a session, headless Agent SDK takes over with the same JSONL format
-
 ## Why this exists
 
-Claude Code ships a built-in `/remote-control` feature, but it requires the phone's Claude account to match the laptop's. My phone uses a different account, so that feature is unusable. This bot solves the same problem through Discord: the phone authenticates to Discord, the bot runs locally and talks to Claude Code using the laptop's existing credentials. The account-mismatch problem is sidestepped entirely.
+Claude Code ships a built-in `/remote-control`, but it requires the phone's Claude account to match the laptop's. If your phone uses a different account, that feature is unusable. This bot sidesteps the problem: the phone authenticates to *Discord*, the bot runs locally and talks to Claude Code using the laptop's existing credentials.
 
-## What's interesting under the hood
+## Two ways to run
 
-- **Live attach to an already-running `claude.exe`** via Win32 console APIs (`AttachConsole`, `WriteConsoleInput`, `ReadConsoleOutputCharacter`) called through `ctypes`. The bot injects keystrokes into the terminal as if you'd typed them.
-- **Response capture without screen-scraping**: Claude Code persists every turn to a JSONL at `~/.claude/projects/<encoded-cwd>/<session-id>.jsonl`. Tailing that file (waiting for it to stop growing, then parsing new lines) gives clean structured text and tool-use events — no terminal chrome, no ANSI codes.
-- **Console-handle isolation**: the bot would corrupt its own stdio if it called `AttachConsole` directly. Solved by spawning a single-purpose subprocess (`console_helper.py`) per write so the parent process's console is never touched.
-- **Dual mode**: when the requested session is live in a terminal, the bot attaches to it. Otherwise it spawns a headless Claude via the Agent SDK and continues the session from disk. Same on-disk JSONL format = sessions are interchangeable.
-- **Per-tool Discord-button approvals**: the SDK path exposes a `can_use_tool` callback. When Claude wants to run `Edit`/`Write`/`Bash`, the bot posts an embed with Approve/Deny buttons and blocks until the authorised user clicks. Read-only tools auto-run.
+### 1. SDK mode (recommended — clean & reliable)
+In a channel, just type a task. The bot runs a real Claude Code turn via `claude-agent-sdk` in the channel's working directory, streams the response back, and pops **Approve / Deny** buttons before any Edit / Write / Bash. Read-only tools auto-run.
 
-## Architecture
+```
+!cc <prompt>          run a task (or just type in the channel)
+!cc cd <path>         set the working directory
+!cc new               start a fresh session
+!cc sessions          list past sessions
+!cc resume <id>       continue a past session
+!cc status | cancel   inspect / stop the current turn
+```
 
-| Module | Role |
-|---|---|
-| `bot.py` | Discord event loop, command dispatch, prefix + slash commands |
-| `runner.py` | Wraps `claude-agent-sdk` for the headless path |
-| `console_helper.py` | Standalone Win32 `ctypes` subprocess that types into and reads from a foreign console |
-| `live_processes.py` | Reads `~/.claude/sessions/*.json` to find running Claude processes |
-| `session_tail.py` | Polls the JSONL Claude writes during a live turn, parses new entries |
-| `session_files.py` | Lists prior sessions, resolves the `/rename` custom-title metadata |
-| `approvals.py` | Discord button-based tool-approval embed with 5-min timeout |
-| `sessions.py` | SQLite per-channel state (session_id, cwd, attached_pid, last_msg_id) + audit log |
-| `test_all.py` | Backend test sweep |
+### 2. Live terminal mode (drive the real TUI)
+Spawn a real `claude` TUI the bot owns, in its own `#channel`. Type → keystrokes are injected → the bot posts the rendered screen back. A keypad (arrows / Enter / Esc / 1–5) handles pickers and approval popups.
 
-## Features
+```
+!cc launch <name> [cwd]   spawn a TUI session in a new channel
+!cc attach <name|pid>     attach to a running session
+!cc look | pad            print the screen / show the keypad
+!cc keys down,down,enter  send a sequence of keys
+!cc get <path>            upload a file from the session folder
+!cc close                 end the session
+```
 
-**Multi-channel — one Discord channel per terminal:**
-- `!cc launch <name> [cwd]` — start a brand-new terminal, name it, attach a fresh channel
-- `!cc spawn <name>` — attach a new channel to an existing running terminal
-- `!cc close [name]` — detach, **kill the PowerShell window**, delete the channel
-- `!cc cleanup` — sweep orphan PowerShell windows from past `/exit`s
+## Platform implementations
 
-**Per-channel attach:**
-- `!cc live` — list running Claude Code processes by custom name
-- `!cc attach <name>` — drive that terminal from this channel
-- `!cc detach` — disconnect
-- `!cc look` — snapshot the terminal screen
-- Anything typed in an attached channel (no prefix) is typed straight into the terminal
+| Concern | Windows (original) | macOS (port) |
+|---|---|---|
+| Inject keystrokes | Win32 `AttachConsole` / `WriteConsoleInput` | `pty.fork()` — bot owns the pseudo-terminal |
+| Read output | `ReadConsoleOutputCharacter` + JSONL tail | [`pyte`](https://pypi.org/project/pyte/) terminal emulator renders the screen |
+| Process liveness | `tasklist` / `taskkill` / `OpenProcess` | `os.kill` + the `~/.claude/sessions` registry |
+| Entry point | `bot.py` | `bot_mac.py` |
 
-**Driving Claude Code's TUI from Discord:**
-- `!cc pad` — pop a clickable keypad (arrows in inverted-T, Esc / Tab / Bksp / Enter / Space / 1-5 / Look). Each click sends one key and edits the message in place with the new screen
-- `!cc keys <seq>` — raw key passthrough (e.g. `!cc keys down,down,enter`)
-- Type any `/`-prefixed message in an attached channel → bot types it into the terminal, waits for the screen to stabilize, posts the snapshot with a keypad already attached for navigation
-- Tool-approval popups in attached terminals auto-surface as Discord buttons (`✅ Allow / ❌ Deny / 💬 Deny + tell Claude`); the third opens a Modal for free-text reasoning
-- **AskUserQuestion** prompts render immediately (with @mention) as a button menu — one button per option. Tapping navigates the picker (Up-clamp → Down×n → Enter) and confirms; the bot then posts the chosen answer. Multi-select / multi-question prompts fall back to "reply with the number"
+**macOS runtime note:** recent Claude Code builds don't always write the per-session JSONL transcript that the Windows path tails, so live-terminal mode on macOS is **screen-based** (it scrapes the emulated screen after each message). That works, but very long responses can scroll off-screen. **For substantial tasks, prefer SDK mode** — it returns full structured output and proper approval buttons.
 
-**Resilience & restore:**
-- Channels are tracked by `session_id` (durable) rather than PID (ephemeral). When a session restarts in place under a new PID, the bot rebinds the channel instead of closing it
-- On a computer reboot, `_restore_terminals_on_boot` resumes every channel that has a session_id (`claude --resume` in its cwd) and re-attaches to the same Discord channel — your tabs come back
-- Live named sessions that lost their channels are re-adopted on startup; duplicate orphan channels are swept
-- The bot only ever auto-deletes channels under the `terminal` category (override with `TERMINAL_CATEGORY_NAME`) or hex-id orphans — human channels like `notifications` / `control-room` are never touched
-- Messages sent to a channel while the bot was offline are replayed in order on reconnect, de-duplicated against gateway re-delivery
+## Quick start (macOS)
 
-**Sessions:**
-- `!cc sessions` — list past sessions (renamed ones show their `/rename` title)
-- `!cc resume` (no arg) — dropdown picker of the 25 most-recent sessions; pick one and the bot spawns `claude --resume <id>` in a new terminal + new Discord channel
-- `!cc resume <id>` — same, by direct id
+```bash
+# Python 3.12+ recommended (the SDK needs >= 3.10). uv makes this painless:
+uv venv && uv pip install -r requirements.txt
 
-**Headless SDK mode:**
-- `!cc <prompt>` (in a non-attached channel) — spawn a headless Claude via Agent SDK and stream the response
-- `!cc new` / `!cc cancel` / `!cc cd <path>` — manage SDK-mode session state
-- `!cc status` — show current cwd + session id
-- `!cc usage` — fetch usage stats from claude-monitor (model, context %, cost, 5h + weekly limits)
+cp .env.example .env        # then fill in your Discord token + IDs
+./run-mac.sh                # foreground; pkill -f bot_mac.py to stop
+```
 
-**Quality of life:**
-- @mention pings on pending approvals only (turn completions stay quiet to avoid notification overload)
-- SQLite audit log of every command (`sessions.db`)
-- Auto-spawn watcher: a fresh `claude` started in any terminal gets its own Discord channel within ~15 s
+For start-on-login, add a `launchd` LaunchAgent that runs `run-mac.sh`.
 
-## Setup
-
-Windows only. Requires Python 3.10+ and a Discord bot token.
+## Quick start (Windows)
 
 ```powershell
-cd cc-discord-remote
-.\setup.ps1                   # creates .venv, installs deps, scaffolds .env
-# Edit .env with your token, user ID, channel ID
+python -m venv .venv; .\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+copy .env.example .env       # fill in token + IDs
 python bot.py
 ```
 
-Required `.env`:
-```
-DISCORD_TOKEN=<bot token>
-ALLOWED_USER_IDS=<your discord user id>
-ALLOWED_CHANNEL_IDS=<channel id where bot listens>
-DEFAULT_CWD=C:/Users/<you>
-TERMINAL_CATEGORY_NAME=terminal   # optional; category auto-created channels nest under (default "terminal")
-```
+## Configuration
 
-The bot needs **Manage Channels** (create/delete terminal channels) and, if you want it to auto-recreate webhook-backed channels, **Manage Webhooks**.
+All config lives in `.env` (see `.env.example`):
 
-## Limitations (honest)
+- `DISCORD_TOKEN` — your bot token (Developer Portal → Bot → Reset Token; enable **Message Content Intent**).
+- `ALLOWED_USER_IDS` — comma-separated Discord user IDs allowed to drive the bot.
+- `ALLOWED_CHANNEL_IDS` — channels the bot responds in (empty = any).
+- `DEFAULT_CWD` — default working directory for new sessions.
 
-- **Windows only.** Console attach uses Win32. Mac/Linux would need a different approach (`pty` / `tmux`).
-- **Fragile to Claude Code updates.** The JSONL format and session-registry layout are undocumented internals. An update could break the live-attach path; the headless path is safer.
-- **One client per session at a time.** If you type in the terminal and the bot also writes, the JSONL gets garbled. The bot warns when you try to resume a live session.
-- **Long Claude responses scroll past the visible screen.** `!cc look` only captures what's currently rendered, not scrollback. The live-attach path doesn't have this problem because it tails the JSONL, not the screen.
+## Security
 
-## Tech stack
+- The bot only obeys `ALLOWED_USER_IDS` in `ALLOWED_CHANNEL_IDS`. Set these.
+- Approving a tool runs real commands and edits real files on the host machine. Approve deliberately.
+- `DISCORD_TOKEN` is a full credential. `.env` is git-ignored — never commit it. If a token is ever exposed, reset it in the Developer Portal.
 
-Python 3.12 · `discord.py` 2.7 · `claude-agent-sdk` 0.2.82 · raw Win32 via `ctypes` · SQLite · async/await throughout.
+## Credits
 
-## Design decisions worth flagging
-
-- **Why a subprocess for `AttachConsole`?** A Win32 process can only own one console at a time. If the bot called `AttachConsole` directly it would corrupt its own stdio. Spawning `console_helper.py` as a one-shot subprocess per write isolates the attach so the parent process is never affected.
-- **Why tail the JSONL instead of reading the terminal screen?** `ReadConsoleOutputCharacter` only sees the visible window; long responses scroll off. The JSONL has the full structured history (text, tool_use, tool_result), which gives clean responses without ANSI codes or UI chrome.
-- **Why pair tool_use with tool_result by id?** Claude's session JSONL writes them as separate events. Pairing them in the bot means one Discord message per tool — `🛠️ Bash — ls *.py ↳ bot.py runner.py ...` — instead of two scattered ones.
-- **Why a "quiet for 3s + all tools resolved" turn-complete check?** A simpler "file stopped growing for 2s" check fires prematurely during slow tool calls (e.g., a Bash that takes 10s). Tracking unresolved tool IDs and requiring both signals avoids posting partial turns.
-- **Why eager-render AskUserQuestion instead of pairing it?** Every other tool is rendered when its `tool_result` arrives (milliseconds later). AskUserQuestion *blocks Claude until the user answers*, so its result only appears after the answer — pairing would hide the question forever. It's special-cased to render on `tool_use` (with an @mention + buttons) and tracked separately so the eventual result shows as the chosen answer, not a re-render.
-- **Why bind channels to session_id, not PID?** PIDs are ephemeral — they change on any in-place restart and all die on reboot. Binding the channel↔terminal mapping to the durable `session_id` lets the watcher rebind to a session's new PID instead of deleting the channel, and lets the bot resume tabs after a reboot. This single change fixed channels dying mid-question, the reboot wipe, and duplicate messages (two mirror loops on one session) at once.
-
-## License
-
-MIT.
+The Windows implementation and original design are by **[Reuben Lavin](https://github.com/reubenlavin08/cc-discord-remote)**. This repository adds a full **macOS port** (`bot_mac.py`, `mac_console.py`, `mac_live.py`, `mac_terminal.py`) built on `pty` + `pyte`. MIT licensed — see [LICENSE](LICENSE).

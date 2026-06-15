@@ -1,13 +1,23 @@
-"""List currently-running Claude Code processes from the session registry."""
+"""List currently-running Claude Code processes from the session registry.
 
-import ctypes
+Cross-platform: the registry (`~/.claude/sessions/*.json`) and the liveness check are
+the only OS-specific bits. On Windows we probe a process handle via OpenProcess; on
+macOS/Linux we use the standard `os.kill(pid, 0)` signal-zero trick.
+"""
+
 import json
+import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
 
 REGISTRY = Path.home() / ".claude" / "sessions"
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+
+_IS_WINDOWS = sys.platform.startswith("win")
+if _IS_WINDOWS:
+    import ctypes
 
 
 @dataclass
@@ -21,11 +31,24 @@ class LiveClaude:
 
 
 def pid_alive(pid: int) -> bool:
-    h = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
-    if h:
-        ctypes.windll.kernel32.CloseHandle(h)
+    if not pid:
+        return False
+    if _IS_WINDOWS:
+        h = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if h:
+            ctypes.windll.kernel32.CloseHandle(h)
+            return True
+        return False
+    # POSIX: signal 0 doesn't deliver a signal, just checks existence/permission.
+    try:
+        os.kill(pid, 0)
         return True
-    return False
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists but owned by another user
+    except OSError:
+        return False
 
 
 def list_running() -> List[LiveClaude]:
