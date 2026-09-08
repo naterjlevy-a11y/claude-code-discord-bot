@@ -115,7 +115,7 @@ if procs:
         size = target_jsonl.stat().st_size
         # Read from the start, with a short stable_seconds so the test is fast.
         events = asyncio.run(
-            wait_for_completion(target_jsonl, 0, max_wait=5.0, stable_seconds=0.5)
+            wait_for_completion(target_jsonl, 0, max_wait=5.0, quiet_seconds=0.5)
         )
         check("wait_for_completion returns events", len(events) > 0, f"got {len(events)}")
         pieces = extract_user_facing(events)
@@ -147,20 +147,31 @@ PASSED += 1
 
 # ---- runner imports + can_use_tool callback ------------------------------
 header("runner / SDK callback")
-from runner import _make_can_use_tool, READ_ONLY_TOOLS
 
-cb = _make_can_use_tool(None)  # no approver — should deny mutating tools
-
-async def _check_cb():
+# Guarded rather than imported at module level. runner pulls in
+# claude_agent_sdk, and on a machine without it installed the bare import ended
+# the entire run right here, so every section below was silently never reached.
+# This file already skips with warn() when a precondition is missing; match that.
+try:
+    from runner import _make_can_use_tool, READ_ONLY_TOOLS
     from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
-    # Read-only tool → allow
-    res = await cb("Read", {"file_path": "/tmp/x"}, None)
-    return isinstance(res, PermissionResultAllow), \
-           isinstance(await cb("Bash", {"command": "x"}, None), PermissionResultDeny)
+    _have_sdk = True
+except ImportError as exc:
+    _have_sdk = False
+    warn(f"claude-agent-sdk not installed, skipping this section ({exc})")
 
-allow_ok, deny_ok = asyncio.run(_check_cb())
-check("can_use_tool allows Read", allow_ok)
-check("can_use_tool denies Bash with no approver", deny_ok)
+if _have_sdk:
+    cb = _make_can_use_tool(None)  # no approver — should deny mutating tools
+
+    async def _check_cb():
+        # Read-only tool → allow
+        res = await cb("Read", {"file_path": "/tmp/x"}, None)
+        return isinstance(res, PermissionResultAllow), \
+               isinstance(await cb("Bash", {"command": "x"}, None), PermissionResultDeny)
+
+    allow_ok, deny_ok = asyncio.run(_check_cb())
+    check("can_use_tool allows Read", allow_ok)
+    check("can_use_tool denies Bash with no approver", deny_ok)
 
 
 # ---- console_helper (mode=look against an idle Claude) -------------------
